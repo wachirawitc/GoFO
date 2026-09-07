@@ -51,6 +51,7 @@ EXT_RE = re.compile(r"\.(woff2|woff|ttf|otf|eot|svg)\b", re.IGNORECASE)
 FONT_DISPLAY_RE = re.compile(r"font-display\s*:\s*([^;]+)", re.IGNORECASE)
 UNNAMED_SUBSET_RE = re.compile(r"^\[\d+\]$")
 FONT_DISPLAY_VALUES = ("auto", "block", "swap", "fallback", "optional")
+AMP_RE = re.compile(r"&(?:amp;|#0*38;|#[xX]0*26;)")
 
 
 # --------------------------------------------------------------------------
@@ -243,6 +244,16 @@ def url_suffix(url: str) -> str:
     return ""
 
 
+def normalize_url(url: str) -> str:
+    """Undo the HTML escaping of URLs copied straight out of a <link> tag.
+
+    Google Fonts embed snippets separate parameters with '&', which becomes
+    '&amp;' inside an HTML attribute. Left as-is, the API reads the extra
+    families as unknown 'amp;family' parameters and silently ignores them.
+    """
+    return AMP_RE.sub("&", url.strip())
+
+
 def plan_css(css: str, names: dict, order: list,
              subsets=None, font_display: str = "") -> tuple:
     """Plan every edit for one stylesheet. No network calls happen here.
@@ -340,7 +351,11 @@ def run(urls, out_dir: str, out_css: str, formats, term: Term,
     dot = "\u00b7" if term.unicode else "."
 
     term.line(term.bold("Fetching stylesheets"))
-    for url in urls:
+    for raw_url in urls:
+        url = normalize_url(raw_url)
+        if url != raw_url.strip():
+            term.line(f"  {term.yellow('!')} un-escaped &amp; in URL "
+                      f"{term.dim('- looks like it was copied from HTML')}")
         host = urlparse(url).netloc or url
         for fmt in formats:
             agent = USER_AGENTS.get(fmt)
