@@ -48,6 +48,9 @@ FONT_FACE_RE = re.compile(
 )
 URL_RE = re.compile(r"url\(\s*(?P<quote>['\"]?)(?P<url>[^'\")]+)(?P=quote)\s*\)")
 EXT_RE = re.compile(r"\.(woff2|woff|ttf|otf|eot|svg)\b", re.IGNORECASE)
+FONT_DISPLAY_RE = re.compile(r"font-display\s*:\s*([^;]+)", re.IGNORECASE)
+UNNAMED_SUBSET_RE = re.compile(r"^\[\d+\]$")
+FONT_DISPLAY_VALUES = ("auto", "block", "swap", "fallback", "optional")
 
 
 # --------------------------------------------------------------------------
@@ -240,15 +243,48 @@ def url_suffix(url: str) -> str:
     return ""
 
 
-def plan_css(css: str, names: dict, order: list) -> list:
-    """Assign a local filename to every remote font URL. No network here."""
-    replacements = []
+def plan_css(css: str, names: dict, order: list,
+             subsets=None, font_display: str = "") -> tuple:
+    """Plan every edit for one stylesheet. No network calls happen here.
+
+    Returns (replacements, subsets_seen). A replacement is a tuple
+    (start, end, kind, payload) where kind is:
+      "url"  - swap a remote URL for a local filename
+      "drop" - delete a whole @font-face block (subset filtered out)
+      "text" - insert or overwrite a declaration
+    """
+    replacements: list = []
+    seen: list = []
+
     for face in FONT_FACE_RE.finditer(css):
         body = face.group("body")
-        subset = face.group("subset") or ""
+        subset = (face.group("subset") or "").strip()
+        # css2 sometimes labels variable-font ranges "[0]", "[1]" instead of a
+        # script name; those are not subsets a user could filter on.
+        named = bool(subset) and not UNNAMED_SUBSET_RE.match(subset)
+        if named and subset not in seen:
+            seen.append(subset)
+
+        # The filter only applies to blocks Google actually labelled, so an
+        # unlabelled stylesheet is never emptied out by accident.
+        if subsets and named and subset.lower() not in subsets:
+            replacements.append((face.start(), face.end(), "drop", None))
+            continue
+
         family = prop(body, "font-family", "font")
         style = prop(body, "font-style", "normal")
         weight = prop(body, "font-weight", "400")
+        base = face.start("body")
+
+        if font_display:
+            current = FONT_DISPLAY_RE.search(body)
+            if current:
+                replacements.append((base + current.start(1),
+                                     base + current.end(1),
+                                     "text", font_display))
+            else:
+                replacements.append((base, base, "text",
+                                     f"\n  font-display: {font_display};"))
 
         for ref in URL_RE.finditer(body):
             url = ref.group("url")
@@ -262,35 +298,46 @@ def plan_css(css: str, names: dict, order: list) -> list:
                     set(names.values()),
                 )
                 order.append(url)
-            start = face.start("body") + ref.start()
-            end = face.start("body") + ref.end()
-            replacements.append((start, end, url, url_suffix(url)))
-    return replacements
+            replacements.append((base + ref.start(), base + ref.end(),
+                                 "url", (url, url_suffix(url))))
+
+    replacements.sort(key=lambda r: (r[0], r[1]))
+    return replacements, seen
 
 
 def apply_replacements(css: str, replacements: list, names: dict, failed: set) -> str:
     out, cursor = [], 0
-    for start, end, url, suffix in replacements:
-        if url in failed:
-            continue  # leave the remote URL in place so the CSS still works
+    for start, end, kind, payload in replacements:
+        if kind == "url":
+            url, suffix = payload
+            if url in failed:
+                continue  # leave the remote URL in place so the CSS still works
+            text = f"url('{names[url]}{suffix}')"
+        elif kind == "drop":
+            text = ""
+        else:
+            text = payload
         out.append(css[cursor:start])
-        out.append(f"url('{names[url]}{suffix}')")
+        out.append(text)
         cursor = end
     out.append(css[cursor:])
-    return "".join(out)
+    return re.sub(r"\n{3,}", "\n\n", "".join(out))
 
 
 # --------------------------------------------------------------------------
 # main flow
 # --------------------------------------------------------------------------
 
-def run(urls, out_dir: str, out_css: str, formats, term: Term) -> int:
+def run(urls, out_dir: str, out_css: str, formats, term: Term,
+        subsets=None, font_display: str = "", force: bool = False) -> int:
     os.makedirs(out_dir, exist_ok=True)
     names: dict[str, str] = {}
     order: list[str] = []
     documents: list[tuple[str, list]] = []
+    subsets_seen: list = []
     tick = "\u2713" if term.unicode else "+"
     cross = "\u2717" if term.unicode else "x"
+    dot = "\u00b7" if term.unicode else "."
 
     term.line(term.bold("Fetching stylesheets"))
     for url in urls:
@@ -313,17 +360,30 @@ def run(urls, out_dir: str, out_css: str, formats, term: Term) -> int:
                 term.line(f"  {term.red(cross)} {label} {term.dim(f'- {error}')}")
                 continue
 
-            replacements = plan_css(css, names, order)
-            if not replacements:
-                term.line(f"  {term.yellow('-')} {label} {term.dim('- no @font-face found')}")
+            replacements, seen = plan_css(css, names, order, subsets, font_display)
+            for name in seen:
+                if name not in subsets_seen:
+                    subsets_seen.append(name)
+
+            refs = sum(1 for r in replacements if r[2] == "url")
+            dropped = sum(1 for r in replacements if r[2] == "drop")
+            if not refs:
+                reason = ("every @font-face was filtered out"
+                          if dropped else "no @font-face found")
+                term.line(f"  {term.yellow('-')} {label} {term.dim(f'- {reason}')}")
                 continue
 
             documents.append((css, replacements))
-            term.line(f"  {term.green(tick)} {label} "
-                      f"{term.dim(f'- {len(replacements)} reference(s)')}")
+            note = f"- {refs} reference(s)"
+            if dropped:
+                note += f", {dropped} block(s) filtered"
+            term.line(f"  {term.green(tick)} {label} {term.dim(note)}")
 
     if not order:
         term.line(term.red("Nothing to download. Check the URL and try again."))
+        if subsets and subsets_seen:
+            term.line(term.dim("Subsets offered by this stylesheet: "
+                               + ", ".join(subsets_seen)))
         return 1
 
     term.line()
@@ -332,10 +392,22 @@ def run(urls, out_dir: str, out_css: str, formats, term: Term) -> int:
     bar.show("starting")
     failed: set[str] = set()
     total_bytes = 0
+    reused = 0
 
     for url in order:
         filename = names[url]
+        dest = os.path.join(out_dir, filename)
         bar.show(filename)
+
+        if os.path.exists(dest) and not force:
+            reused += 1
+            total_bytes += os.path.getsize(dest)
+            bar.advance(filename)
+            term.line(f"  {term.dim(dot)} {filename} "
+                      f"{term.dim('- already present, skipped')}")
+            bar.show(filename)
+            continue
+
         try:
             data = http_get(url.split("#")[0], USER_AGENTS["woff2"])
         except urllib.error.URLError as err:
@@ -345,7 +417,7 @@ def run(urls, out_dir: str, out_css: str, formats, term: Term) -> int:
             bar.show(filename)
             continue
 
-        with open(os.path.join(out_dir, filename), "wb") as fh:
+        with open(dest, "wb") as fh:
             fh.write(data)
         total_bytes += len(data)
         bar.advance(filename)
@@ -364,9 +436,12 @@ def run(urls, out_dir: str, out_css: str, formats, term: Term) -> int:
         fh.write(body + "\n")
 
     saved = len(order) - len(failed)
+    detail = human_size(total_bytes)
+    if reused:
+        detail += f", {reused} reused"
     term.line()
     term.line(f"{term.green(tick)} {term.bold(f'{saved} font file(s)')} "
-              f"{term.dim(f'({human_size(total_bytes)})')} -> {out_dir}/")
+              f"{term.dim(f'({detail})')} -> {out_dir}/")
     term.line(f"{term.green(tick)} stylesheet -> {css_path}")
     if failed:
         term.line(term.yellow(
@@ -394,10 +469,20 @@ def parse_args(argv):
                    help="stylesheet filename (default: fonts.css)")
     p.add_argument("--formats", default=legacy.get("formats", "woff2"),
                    help="comma-separated formats, e.g. woff2,woff,ttf")
+    p.add_argument("--font-display", metavar="VALUE", default="",
+                   choices=("",) + FONT_DISPLAY_VALUES,
+                   help="set font-display in every rule: "
+                        + ", ".join(FONT_DISPLAY_VALUES))
+    p.add_argument("--subset", default="", metavar="LIST",
+                   help="comma-separated subsets to keep, e.g. latin,latin-ext,thai "
+                        "(default: keep all)")
+    p.add_argument("--force", action="store_true",
+                   help="re-download files that are already in the output directory")
     p.add_argument("--plain", action="store_true",
                    help="disable spinner and progress bar")
     args = p.parse_args(rest)
     args.formats = [f.strip() for f in args.formats.split(",") if f.strip()]
+    args.subset = {s.strip().lower() for s in args.subset.split(",") if s.strip()}
     return args
 
 
@@ -405,7 +490,9 @@ def main():
     args = parse_args(sys.argv[1:])
     term = Term(animate=not args.plain)
     try:
-        sys.exit(run(args.urls, args.out_dir, args.out_css, args.formats, term))
+        sys.exit(run(args.urls, args.out_dir, args.out_css, args.formats, term,
+                     subsets=args.subset, font_display=args.font_display,
+                     force=args.force))
     except KeyboardInterrupt:
         term.clear()
         term.line("Aborted.")
