@@ -1,0 +1,57 @@
+# --- Go-FO output ---------------------------------------------------------
+# Downloaded fonts from test runs. Remove or narrow these if you ever want to
+# commit a sample output directory.
+fonts/
+assets/fonts/
+tmp/
+*.woff
+*.woff2
+*.ttf
+*.otf
+*.eot
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# packaging / distribution
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+
+# virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# testing & coverage
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+
+# --- Editors --------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS -------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Secrets --------------------------------------------------------------
+.env
+.env.local
