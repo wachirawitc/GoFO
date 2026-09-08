@@ -26,7 +26,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 # Google Fonts sniffs the User-Agent and serves a different CSS per format.
 # Note: the /css2 endpoint returns woff2 for almost every agent nowadays;
@@ -255,7 +255,7 @@ def normalize_url(url: str) -> str:
 
 
 def plan_css(css: str, names: dict, order: list,
-             subsets=None, font_display: str = "") -> tuple:
+             subsets=None, font_display: str = "", base_url: str = "") -> tuple:
     """Plan every edit for one stylesheet. No network calls happen here.
 
     Returns (replacements, subsets_seen). A replacement is a tuple
@@ -301,6 +301,10 @@ def plan_css(css: str, names: dict, order: list,
             url = ref.group("url")
             if url.startswith("data:"):
                 continue
+            # Resolve relative URLs (e.g. ./files/font.woff2) against the
+            # stylesheet's own URL so downloads work for any CSS source.
+            if base_url and not urlparse(url).scheme:
+                url = urljoin(base_url, url)
             hint = body[ref.end():ref.end() + 80].split(";")[0]
             if url not in names:
                 ext = guess_ext(url, hint)
@@ -375,7 +379,8 @@ def run(urls, out_dir: str, out_css: str, formats, term: Term,
                 term.line(f"  {term.red(cross)} {label} {term.dim(f'- {error}')}")
                 continue
 
-            replacements, seen = plan_css(css, names, order, subsets, font_display)
+            replacements, seen = plan_css(css, names, order, subsets, font_display,
+                                           base_url=url)
             for name in seen:
                 if name not in subsets_seen:
                     subsets_seen.append(name)
