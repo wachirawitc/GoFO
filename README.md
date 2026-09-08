@@ -1,6 +1,6 @@
 # Go-FO
 
-**Go**ogle **F**onts **O**ffline — a single-file Python CLI that downloads a Google Fonts stylesheet and everything it references, then rewrites the CSS to point at the local copies.
+**Go** **F**onts **O**ffline — a single-file Python CLI that downloads stylesheets from Google Fonts, Bunny Fonts, Fontsource (jsDelivr), or any other CSS source, and rewrites the `@font-face` rules to point at local copies.
 
 Useful when you need fonts bundled with your project: air-gapped machines, GDPR-conscious deployments that must not hit `fonts.gstatic.com`, offline demos, or just faster first paint without a third-party round trip.
 
@@ -115,6 +115,12 @@ Fontsource from jsdelivr:
 
 ```bash
 python Go-FO.py "https://cdn.jsdelivr.net/npm/@fontsource/geist-mono@latest/700.css"
+```
+
+Bunny Fonts:
+
+```bash
+python Go-FO.py "https://fonts.bunny.net/css?family=lato:400,700"
 ```
 
 Batch download from a file:

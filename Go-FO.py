@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Go-FO.py - Google Fonts Offline: download Google Fonts for local use.
+Go-FO.py - Go Fonts Offline: download Fonts for local use.
 
 Usage:
     python Go-FO.py "https://fonts.googleapis.com/css?family=Open+Sans"
