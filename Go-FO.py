@@ -17,6 +17,8 @@ Every font file is written into out-dir together with a CSS file whose
 from __future__ import annotations
 
 import argparse
+import glob
+import hashlib
 import itertools
 import os
 import re
@@ -26,6 +28,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 
 # Google Fonts sniffs the User-Agent and serves a different CSS per format.
@@ -46,12 +49,20 @@ FONT_FACE_RE = re.compile(
     r"@font-face\s*\{(?P<body>[^}]*)\}",
     re.IGNORECASE,
 )
+IMPORT_RE = re.compile(
+    r"@import\s+url\(\s*['\"]?(?P<url>[^'\")]+)['\"]?\s*\)\s*;",
+    re.IGNORECASE,
+)
 URL_RE = re.compile(r"url\(\s*(?P<quote>['\"]?)(?P<url>[^'\")]+)(?P=quote)\s*\)")
 EXT_RE = re.compile(r"\.(woff2|woff|ttf|otf|eot|svg)\b", re.IGNORECASE)
 FONT_DISPLAY_RE = re.compile(r"font-display\s*:\s*([^;]+)", re.IGNORECASE)
 UNNAMED_SUBSET_RE = re.compile(r"^\[\d+\]$")
 FONT_DISPLAY_VALUES = ("auto", "block", "swap", "fallback", "optional")
 AMP_RE = re.compile(r"&(?:amp;|#0*38;|#[xX]0*26;)")
+
+DEFAULT_RETRIES = 3
+DEFAULT_CONCURRENCY = 6
+IMPORT_DEPTH_LIMIT = 5
 
 
 # --------------------------------------------------------------------------
@@ -68,6 +79,7 @@ class Term:
         self.animate = animate and self.tty
         self.color = self.tty and "NO_COLOR" not in os.environ
         self.unicode = self._probe_unicode()
+        self._lock = threading.Lock()
 
     def _probe_unicode(self) -> bool:
         encoding = getattr(self.stream, "encoding", None) or "ascii"
@@ -95,18 +107,22 @@ class Term:
         """Draw a line that the next write will overwrite."""
         if not self.animate:
             return
-        self.stream.write("\r\033[2K" + text)
-        self.stream.flush()
+        with self._lock:
+            self.stream.write("\r\033[2K" + text)
+            self.stream.flush()
 
     def clear(self) -> None:
         if self.animate:
-            self.stream.write("\r\033[2K")
-            self.stream.flush()
+            with self._lock:
+                self.stream.write("\r\033[2K")
+                self.stream.flush()
 
     def line(self, text: str = "") -> None:
-        self.clear()
-        self.stream.write(text + "\n")
-        self.stream.flush()
+        with self._lock:
+            if self.animate:
+                self.stream.write("\r\033[2K")
+            self.stream.write(text + "\n")
+            self.stream.flush()
 
 
 class Spinner:
@@ -187,14 +203,36 @@ def human_size(num: int) -> str:
 
 
 # --------------------------------------------------------------------------
-# css parsing
+# networking
 # --------------------------------------------------------------------------
 
-def http_get(url: str, user_agent: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read()
+def http_get(url: str, user_agent: str, retries: int = DEFAULT_RETRIES) -> bytes:
+    """Fetch *url* with retries and exponential backoff.
 
+    On transient errors the request is retried up to *retries* times with
+    a delay of 1 s, 2 s, 4 s, … between attempts.  Permanent HTTP errors
+    (4xx) are raised immediately.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as err:
+            if 400 <= err.code < 500:
+                raise                       # not retryable
+            last_err = err
+        except (urllib.error.URLError, OSError) as err:
+            last_err = err
+        if attempt < retries:
+            time.sleep(2 ** (attempt - 1))  # 1 s, 2 s, 4 s, …
+    raise last_err  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------
+# css parsing
+# --------------------------------------------------------------------------
 
 def prop(body: str, name: str, default: str = "") -> str:
     """Pull a single declaration out of an @font-face body."""
@@ -235,6 +273,19 @@ def unique_name(name: str, taken) -> str:
     return candidate
 
 
+def hashed_name(name: str, data: bytes, length: int = 8) -> str:
+    """Insert a short content hash before the file extension.
+
+    ``inter-400-normal-latin.woff2`` becomes
+    ``inter-400-normal-latin.a3f2c1b8.woff2``.
+    """
+    digest = hashlib.sha256(data).hexdigest()[:length]
+    base, dot, ext = name.rpartition(".")
+    if not dot:
+        return f"{name}.{digest}"
+    return f"{base}.{digest}.{ext}"
+
+
 def url_suffix(url: str) -> str:
     """Keep ?#iefix (IE8) and #FontName (SVG) attached to the rewritten path."""
     if "?" in url:
@@ -252,6 +303,36 @@ def normalize_url(url: str) -> str:
     families as unknown 'amp;family' parameters and silently ignores them.
     """
     return AMP_RE.sub("&", url.strip())
+
+
+def resolve_imports(css: str, base_url: str, user_agent: str,
+                    term: Term, depth: int = 0) -> str:
+    """Recursively fetch ``@import url(...)`` rules and inline them.
+
+    The imported CSS replaces the ``@import`` statement so the rest of the
+    pipeline sees a single flat stylesheet.  A *depth* guard prevents
+    infinite loops or excessively deep chains.
+    """
+    if depth >= IMPORT_DEPTH_LIMIT:
+        return css
+
+    tick = "\u2713" if term.unicode else "+"
+    cross = "\u2717" if term.unicode else "x"
+
+    def _replace(match):
+        import_url = match.group("url")
+        if not urlparse(import_url).scheme:
+            import_url = urljoin(base_url, import_url)
+        try:
+            imported = http_get(import_url, user_agent).decode("utf-8", "replace")
+            term.line(f"  {term.green(tick)} @import {term.dim(import_url)}")
+        except urllib.error.URLError as err:
+            term.line(f"  {term.red(cross)} @import {term.dim(f'{import_url} - {err}')}")
+            return match.group(0)  # keep the original @import on failure
+        # Recurse in case the imported sheet has its own @imports.
+        return resolve_imports(imported, import_url, user_agent, term, depth + 1)
+
+    return IMPORT_RE.sub(_replace, css)
 
 
 def plan_css(css: str, names: dict, order: list,
@@ -343,8 +424,21 @@ def apply_replacements(css: str, replacements: list, names: dict, failed: set) -
 # main flow
 # --------------------------------------------------------------------------
 
+def _download_one(url: str, dest: str, user_agent: str):
+    """Download a single font file. Returns (url, data_bytes, error)."""
+    try:
+        data = http_get(url.split("#")[0], user_agent)
+        with open(dest, "wb") as fh:
+            fh.write(data)
+        return url, data, None
+    except (urllib.error.URLError, OSError) as err:
+        return url, None, err
+
+
 def run(urls, out_dir: str, out_css: str, formats, term: Term,
-        subsets=None, font_display: str = "", force: bool = False) -> int:
+        subsets=None, font_display: str = "", force: bool = False,
+        concurrency: int = DEFAULT_CONCURRENCY,
+        hashed: bool = False) -> int:
     os.makedirs(out_dir, exist_ok=True)
     names: dict[str, str] = {}
     order: list[str] = []
@@ -378,6 +472,9 @@ def run(urls, out_dir: str, out_css: str, formats, term: Term,
             if error is not None:
                 term.line(f"  {term.red(cross)} {label} {term.dim(f'- {error}')}")
                 continue
+
+            # Inline any @import rules before planning.
+            css = resolve_imports(css, url, agent, term)
 
             replacements, seen = plan_css(css, names, order, subsets, font_display,
                                            base_url=url)
@@ -414,36 +511,78 @@ def run(urls, out_dir: str, out_css: str, formats, term: Term,
     total_bytes = 0
     reused = 0
 
+    # Separate already-present files from those that need downloading.
+    to_download: list[tuple[str, str]] = []  # (url, dest)
     for url in order:
         filename = names[url]
         dest = os.path.join(out_dir, filename)
-        bar.show(filename)
 
-        if os.path.exists(dest) and not force:
+        # When --hashed, a prior run may have renamed the file to include a
+        # hash.  Look for an existing file matching the pattern name.HASH.ext.
+        existing_hashed = None
+        if hashed and not os.path.exists(dest):
+            base, _sep, ext = filename.rpartition(".")
+            if _sep:
+                pattern = os.path.join(out_dir, f"{base}.*.{ext}")
+                matches = glob.glob(pattern)
+                if matches:
+                    existing_hashed = matches[0]
+
+        if (os.path.exists(dest) or existing_hashed) and not force:
             reused += 1
-            total_bytes += os.path.getsize(dest)
+            reuse_path = existing_hashed or dest
+            size = os.path.getsize(reuse_path)
+            total_bytes += size
+            if hashed:
+                if existing_hashed:
+                    # Already hashed from a prior run — read its name directly.
+                    names[url] = os.path.basename(existing_hashed)
+                    filename = names[url]
+                else:
+                    with open(dest, "rb") as fh:
+                        data = fh.read()
+                    new_name = hashed_name(filename, data)
+                    new_dest = os.path.join(out_dir, new_name)
+                    if new_dest != dest:
+                        os.replace(dest, new_dest)
+                    names[url] = new_name
+                    filename = new_name
             bar.advance(filename)
             term.line(f"  {term.dim(dot)} {filename} "
                       f"{term.dim('- already present, skipped')}")
             bar.show(filename)
-            continue
+        else:
+            to_download.append((url, dest))
 
-        try:
-            data = http_get(url.split("#")[0], USER_AGENTS["woff2"])
-        except urllib.error.URLError as err:
-            failed.add(url)
-            bar.advance(filename)
-            term.line(f"  {term.red(cross)} {filename} {term.dim(f'- {err}')}")
+    # Download new files concurrently.
+    workers = min(concurrency, len(to_download)) if to_download else 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_download_one, url, dest, USER_AGENTS["woff2"]): url
+            for url, dest in to_download
+        }
+        for future in as_completed(futures):
+            url = futures[future]
+            filename = names[url]
+            _url, data, err = future.result()
+            if err is not None:
+                failed.add(url)
+                bar.advance(filename)
+                term.line(f"  {term.red(cross)} {filename} {term.dim(f'- {err}')}")
+            else:
+                if hashed:
+                    new_name = hashed_name(filename, data)
+                    new_dest = os.path.join(out_dir, new_name)
+                    old_dest = os.path.join(out_dir, filename)
+                    if new_dest != old_dest:
+                        os.replace(old_dest, new_dest)
+                    names[url] = new_name
+                    filename = new_name
+                total_bytes += len(data)
+                bar.advance(filename)
+                term.line(f"  {term.green(tick)} {filename} "
+                          f"{term.dim(f'- {human_size(len(data))}')}")
             bar.show(filename)
-            continue
-
-        with open(dest, "wb") as fh:
-            fh.write(data)
-        total_bytes += len(data)
-        bar.advance(filename)
-        term.line(f"  {term.green(tick)} {filename} "
-                  f"{term.dim(f'- {human_size(len(data))}')}")
-        bar.show(filename)
 
     bar.finish()
 
@@ -470,6 +609,20 @@ def run(urls, out_dir: str, out_css: str, formats, term: Term,
     return 0
 
 
+def load_urls_from_file(path: str) -> list[str]:
+    """Read stylesheet URLs from a file, one per line.
+
+    Blank lines and lines starting with ``#`` are ignored.
+    """
+    urls: list[str] = []
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                urls.append(line)
+    return urls
+
+
 def parse_args(argv):
     """Accept both --out-dir style and the original outDir=... style."""
     legacy, rest = {}, []
@@ -482,7 +635,7 @@ def parse_args(argv):
 
     p = argparse.ArgumentParser(
         description="Download Google Fonts for offline use.")
-    p.add_argument("urls", nargs="+", help="Google Fonts stylesheet URL(s)")
+    p.add_argument("urls", nargs="*", help="Google Fonts stylesheet URL(s)")
     p.add_argument("--out-dir", default=legacy.get("outDir", "fonts"),
                    help="output directory (default: fonts)")
     p.add_argument("--out-css", default=legacy.get("outCss", "fonts.css"),
@@ -500,9 +653,30 @@ def parse_args(argv):
                    help="re-download files that are already in the output directory")
     p.add_argument("--plain", action="store_true",
                    help="disable spinner and progress bar")
+    p.add_argument("--from-file", metavar="FILE",
+                   help="read stylesheet URLs from FILE (one per line, "
+                        "# comments and blank lines ignored)")
+    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+                   metavar="N",
+                   help=f"number of parallel downloads (default: {DEFAULT_CONCURRENCY})")
+    p.add_argument("--hashed", action="store_true",
+                   help="append a content hash to each font filename for "
+                        "cache-busting (e.g. font-400-normal.a3f2c1b8.woff2)")
     args = p.parse_args(rest)
     args.formats = [f.strip() for f in args.formats.split(",") if f.strip()]
     args.subset = {s.strip().lower() for s in args.subset.split(",") if s.strip()}
+
+    # Merge URLs from --from-file with positional URLs.
+    if args.from_file:
+        try:
+            file_urls = load_urls_from_file(args.from_file)
+        except OSError as err:
+            p.error(f"cannot read URL file: {err}")
+        args.urls = (args.urls or []) + file_urls
+
+    if not args.urls:
+        p.error("no URLs given (pass them as arguments or via --from-file)")
+
     return args
 
 
@@ -512,7 +686,8 @@ def main():
     try:
         sys.exit(run(args.urls, args.out_dir, args.out_css, args.formats, term,
                      subsets=args.subset, font_display=args.font_display,
-                     force=args.force))
+                     force=args.force, concurrency=args.concurrency,
+                     hashed=args.hashed))
     except KeyboardInterrupt:
         term.clear()
         term.line("Aborted.")
